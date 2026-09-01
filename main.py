@@ -15,6 +15,7 @@ from google.genai import types
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_BASEURL = os.getenv("GEMINI_BASE_URL", "").strip()
 GEMMA_MODEL = os.getenv("GEMMA_MODEL", "gemma-3-27b-it").strip()
 BOT_NAME = os.getenv("BOT_NAME", "Gemma").strip()
 BOT_ENABLED = bool(GEMINI_API_KEY)
@@ -70,8 +71,16 @@ def load_bot_instruction():
 
 BOT_CUSTOM_INSTRUCTION = load_bot_instruction()
 
-genai_client = genai.Client(api_key=GEMINI_API_KEY) if BOT_ENABLED else None
-
+genai_client = (
+    genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptionsDict(
+            base_url=GEMINI_BASEURL,
+            base_url_resource_scope=types.ResourceScope.COLLECTION,
+        ) if GEMINI_BASEURL else None
+    )
+    if BOT_ENABLED else None
+)
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", uuid.uuid4().hex)
 socketio = SocketIO(app, cors_allowed_origins="*")
