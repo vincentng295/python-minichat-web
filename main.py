@@ -124,7 +124,7 @@ def add_message(user, text, mtype="chat"):
     return msg
 
 
-def load_recent_messages(limit=None):
+def load_recent_messages(limit=None, for_display=False):
     limit = limit or HISTORY_LOAD_LIMIT
     with db_lock:
         conn = get_db()
@@ -133,7 +133,23 @@ def load_recent_messages(limit=None):
             (limit,),
         ).fetchall()
         conn.close()
-    return [dict(r) for r in reversed(rows)]
+    result = [dict(r) for r in reversed(rows)]
+    if for_display:
+        # Ở chế độ giống người thật, giả lập tin nhắn bot như tin nhắn user bình
+        # thường cho client. Dữ liệu gốc trong DB vẫn giữ type="bot" để dùng
+        # làm ngữ cảnh (phân biệt role model/user) khi gọi model.
+        result = [mask_bot_type(m) for m in result]
+    return result
+
+
+def mask_bot_type(msg):
+    """Ở chế độ giống người thật, hiển thị tin nhắn bot cho client như tin nhắn
+    chat bình thường (bỏ nhãn/khung riêng của bot). DB và ngữ cảnh gọi model
+    vẫn giữ nguyên type="bot" gốc — hàm này chỉ áp dụng cho bản gửi hiển thị."""
+    if HUMAN_LIKE_MODE and msg["type"] == "bot":
+        msg = dict(msg)
+        msg["type"] = "chat"
+    return msg
 
 
 init_db()
@@ -220,7 +236,7 @@ def on_join(data):
     join_room(ROOM)
 
     emit("joined", {"username": username})
-    emit("history", {"messages": load_recent_messages()})
+    emit("history", {"messages": load_recent_messages(for_display=True)})
     emit("user_list", {"users": list(online_users.values())}, room=ROOM)
     sys_msg = add_message("system", f"{username} đã tham gia phòng chat.", "system")
     emit("new_message", sys_msg, room=ROOM)
@@ -273,7 +289,9 @@ def handle_bot_reply(username, text):
     reply = call_gemma(f"{username}: {text}", recent_context)
     if reply:
         bot_msg = add_message(BOT_NAME, reply, "bot")
-        socketio.emit("new_message", bot_msg, room=ROOM)
+        # DB vẫn lưu type="bot" để phân biệt role khi xây ngữ cảnh cho model;
+        # chỉ mask type khi phát cho client hiển thị (chế độ giống người thật).
+        socketio.emit("new_message", mask_bot_type(bot_msg), room=ROOM)
 
 
 if __name__ == "__main__":
