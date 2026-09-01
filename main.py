@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from authlib.integrations.flask_client import OAuth
 from google import genai
 from google.genai import types
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 try:
     from PIL import Image
@@ -104,6 +105,7 @@ genai_client = (
     if BOT_ENABLED else None
 )
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", uuid.uuid4().hex)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
