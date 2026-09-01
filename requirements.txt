@@ -4,3 +4,4 @@ python-dotenv
 eventlet
 google-genai
 Authlib
+Pillow

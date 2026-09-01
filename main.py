@@ -1,17 +1,23 @@
 import os
 import re
+import io
 import time
 import uuid
 import sqlite3
 import threading
 import subprocess
 import importlib
-from flask import Flask, render_template, request, session, redirect, url_for
+from flask import Flask, render_template, request, session, redirect, url_for, send_file, abort
 from flask_socketio import SocketIO, emit, join_room
 from dotenv import load_dotenv
 from authlib.integrations.flask_client import OAuth
 from google import genai
 from google.genai import types
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 load_dotenv()
 
@@ -29,6 +35,14 @@ BOT_MAX_OUTPUT_TOKENS = int(os.getenv("BOT_MAX_OUTPUT_TOKENS", "300"))
 # THINKING_LEVEL để trống = tắt; các giá trị hợp lệ tuỳ model (vd: MINIMAL, LOW, MEDIUM, HIGH)
 BOT_THINKING_LEVEL = os.getenv("BOT_THINKING_LEVEL", "").strip()
 BOT_ENABLE_GOOGLE_SEARCH = os.getenv("BOT_ENABLE_GOOGLE_SEARCH", "false").strip().lower() in ("1", "true", "yes")
+
+# Avatar cho bot (tuỳ chọn). Nếu file tồn tại, ảnh sẽ được tự động crop vuông
+# ở giữa (auto cut) và giới hạn tối đa 512x512 khi phục vụ qua route /avatar/bot.
+BOT_AVATAR_FILE = os.getenv(
+    "BOT_AVATAR_FILE",
+    os.path.join(os.path.dirname(__file__), "static", "virtualman.png"),
+)
+BOT_AVATAR_MAX_SIZE = 512
 
 HOST = os.getenv("HOST", "127.99.128.39")
 PORT = int(os.getenv("PORT", "8888"))
@@ -201,6 +215,81 @@ def mask_bot_type(msg):
 
 init_db()
 
+
+# =========================================
+# Avatar bot: crop vuông giữa ảnh (auto cut) + giới hạn tối đa 512x512
+# =========================================
+_bot_avatar_bytes = None
+_bot_avatar_mimetype = None
+_bot_avatar_mtime = None
+
+
+def _process_bot_avatar():
+    """Đọc BOT_AVATAR_FILE (nếu có), crop vuông ở giữa và resize (chỉ thu nhỏ,
+    không phóng to) về tối đa BOT_AVATAR_MAX_SIZE x BOT_AVATAR_MAX_SIZE.
+    Kết quả được cache trong bộ nhớ."""
+    global _bot_avatar_bytes, _bot_avatar_mimetype, _bot_avatar_mtime
+
+    if not os.path.exists(BOT_AVATAR_FILE):
+        _bot_avatar_bytes = None
+        return
+
+    if Image is None:
+        print("[!] Thiếu thư viện Pillow - không thể xử lý BOT_AVATAR_FILE, bỏ qua avatar bot.")
+        _bot_avatar_bytes = None
+        return
+
+    try:
+        mtime = os.path.getmtime(BOT_AVATAR_FILE)
+        if _bot_avatar_bytes is not None and _bot_avatar_mtime == mtime:
+            return  # đã cache, ảnh gốc không đổi
+
+        with Image.open(BOT_AVATAR_FILE) as img:
+            img = img.convert("RGBA") if img.mode in ("P", "LA") else img.convert("RGB") if img.mode not in ("RGB", "RGBA") else img
+
+            # Crop vuông ở giữa (auto cut cạnh dài hơn)
+            w, h = img.size
+            side = min(w, h)
+            left = (w - side) // 2
+            top = (h - side) // 2
+            img = img.crop((left, top, left + side, top + side))
+
+            # Chỉ thu nhỏ nếu lớn hơn giới hạn, không phóng to ảnh nhỏ
+            if side > BOT_AVATAR_MAX_SIZE:
+                img = img.resize((BOT_AVATAR_MAX_SIZE, BOT_AVATAR_MAX_SIZE), Image.LANCZOS)
+
+            buf = io.BytesIO()
+            if img.mode == "RGBA":
+                img.save(buf, format="PNG", optimize=True)
+                mimetype = "image/png"
+            else:
+                img.save(buf, format="JPEG", quality=88, optimize=True)
+                mimetype = "image/jpeg"
+
+        _bot_avatar_bytes = buf.getvalue()
+        _bot_avatar_mimetype = mimetype
+        _bot_avatar_mtime = mtime
+        print(f"[*] Avatar bot đã xử lý: {BOT_AVATAR_FILE} -> {side}x{side} (cắt giữa), "
+              f"tối đa {BOT_AVATAR_MAX_SIZE}x{BOT_AVATAR_MAX_SIZE}.")
+    except Exception as e:
+        print(f"[!] Không xử lý được BOT_AVATAR_FILE ({BOT_AVATAR_FILE}): {e}")
+        _bot_avatar_bytes = None
+
+
+_process_bot_avatar()
+BOT_AVATAR_URL = "/avatar/bot" if _bot_avatar_bytes else None
+
+
+@app.route("/avatar/bot")
+def avatar_bot():
+    _process_bot_avatar()  # cho phép cập nhật nếu file avatar đổi khi server đang chạy
+    if not _bot_avatar_bytes:
+        abort(404)
+    return send_file(
+        io.BytesIO(_bot_avatar_bytes),
+        mimetype=_bot_avatar_mimetype,
+        max_age=3600,
+    )
 
 def call_gemma(prompt, history_context):
     """Gọi model Gemma qua SDK google-genai (client.models.generate_content)."""
@@ -393,7 +482,7 @@ def handle_bot_reply(username, text):
     recent_context = load_recent_messages(limit=10)
     reply = call_gemma(f"{username}: {text}", recent_context)
     if reply:
-        bot_msg = add_message(BOT_NAME, reply, "bot")
+        bot_msg = add_message(BOT_NAME, reply, "bot", avatar=BOT_AVATAR_URL)
         # DB vẫn lưu type="bot" để phân biệt role khi xây ngữ cảnh cho model;
         # chỉ mask type khi phát cho client hiển thị (chế độ giống người thật).
         socketio.emit("new_message", mask_bot_type(bot_msg), room=ROOM)
