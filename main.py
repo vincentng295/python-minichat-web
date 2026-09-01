@@ -222,6 +222,7 @@ def call_gemma(prompt, history_context):
         ):
             if chunk.text:
                 response_text += chunk.text
+        print("Calling Gemini, return:", response_text)
         return response_text.strip() or None
     except Exception as e:
         print("Gemma call failed:", e)
