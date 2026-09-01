@@ -1,8 +1,11 @@
 import os
+import re
 import time
 import uuid
 import sqlite3
 import threading
+import subprocess
+import importlib
 from flask import Flask, render_template, request, session
 from flask_socketio import SocketIO, emit, join_room
 from dotenv import load_dotenv
@@ -41,6 +44,16 @@ BOT_INSTRUCTION_FILE = os.getenv(
     "BOT_INSTRUCTION_FILE",
     os.path.join(os.path.dirname(__file__), "instruction.txt"),
 )
+
+# =========================================
+# Cloudflare Tunnel (cloudflared)
+# =========================================
+TUNNEL_ENABLED = os.getenv("TUNNEL", "false").strip().lower() in ("1", "true", "yes")
+TUNNEL_HOST = os.getenv("TUNNEL_HOST", "").strip()
+TUNNEL_TOKEN = os.getenv("TUNNEL_TOKEN", "").strip()
+
+_cloudflared_proc = None
+_cloudflared_url = None
 
 
 def load_bot_instruction():
@@ -294,10 +307,142 @@ def handle_bot_reply(username, text):
         socketio.emit("new_message", mask_bot_type(bot_msg), room=ROOM)
 
 
+# =========================================
+# Cloudflare Tunnel helpers
+# =========================================
+
+def ensure_cloudflared_binary():
+    """Đảm bảo có file thực thi cloudflared trong thư mục hiện tại.
+    Tải về bằng download-cloudflared.py nếu chưa có."""
+    local_name = "cloudflared.exe" if os.name == "nt" else "cloudflared"
+    local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), local_name)
+    if os.path.exists(local_path):
+        return local_path
+
+    try:
+        downloader = importlib.import_module("download-cloudflared")
+        downloader.install_cloudflared()
+    except Exception as e:
+        print(f"[!] Không thể tự động tải cloudflared: {e}")
+        return None
+
+    return local_path if os.path.exists(local_path) else None
+
+
+def write_cloudflared_config():
+    """Sinh config.yml cho named tunnel: trỏ hostname TUNNEL_HOST về server
+    chat đang chạy tại HOST:PORT."""
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yml")
+    config_yml_content = (
+        f"tunnel: {TUNNEL_TOKEN}\n\n"
+        "ingress:\n"
+        f"  - hostname: {TUNNEL_HOST}\n"
+        f"    service: http://{HOST}:{PORT}\n"
+        "  - service: http_status:404\n"
+    )
+    with open(config_path, "w", encoding="utf-8") as f:
+        f.write(config_yml_content)
+    return config_path
+
+
+def launch_cloudflared(bin_path):
+    """Khởi chạy tiến trình cloudflared.
+    - Nếu có TUNNEL_TOKEN: chạy named tunnel (domain = TUNNEL_HOST, cấu hình
+      sẵn trên Cloudflare dashboard cho token đó), dùng config.yml để trỏ
+      hostname về server chat.
+    - Nếu không có TUNNEL_TOKEN (hoặc thiếu TUNNEL_HOST): chạy quick tunnel,
+      Cloudflare sẽ tự cấp một domain tạm dạng *.trycloudflare.com."""
+    if TUNNEL_TOKEN and TUNNEL_HOST:
+        config_path = write_cloudflared_config()
+        cmd = [bin_path, "tunnel", "--config", config_path, "run", "--token", TUNNEL_TOKEN]
+    else:
+        if TUNNEL_TOKEN or TUNNEL_HOST:
+            print("[!] TUNNEL_HOST hoặc TUNNEL_TOKEN chưa được thiết lập đầy đủ - "
+                  "bỏ qua cấu hình named tunnel, dùng domain tạm trycloudflare.com.")
+        cmd = [bin_path, "tunnel", "--url", f"http://{HOST}:{PORT}"]
+
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def monitor_cloudflared(proc):
+    global _cloudflared_url
+    ansi_escape = re.compile(r"\x1b\[[0-9;]*[mK]")
+    try:
+        with proc.stdout:
+            for line in iter(proc.stdout.readline, ""):
+                clean_line = ansi_escape.sub("", line).strip()
+                if not clean_line:
+                    continue
+                print(f"[CLOUDFLARED] {clean_line}")
+
+                if TUNNEL_TOKEN and TUNNEL_HOST:
+                    if _cloudflared_url is None and re.search(r"[Rr]egistered tunnel connection", clean_line):
+                        _cloudflared_url = TUNNEL_HOST
+                        print("\n" + "=" * 60)
+                        print(f" Phòng chat đang chạy tại: https://{TUNNEL_HOST}")
+                        print("=" * 60 + "\n")
+                    continue
+
+                match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", clean_line)
+                if match:
+                    new_url = match.group(0)
+                    if new_url != _cloudflared_url:
+                        _cloudflared_url = new_url
+                        print("\n" + "=" * 60)
+                        print(f" Phòng chat đang chạy tại: {new_url}")
+                        print("=" * 60 + "\n")
+    except Exception:
+        pass
+
+
+def start_tunnel_and_watchdog():
+    """Chạy trong thread nền: đảm bảo cloudflared luôn sống trong khi app chạy."""
+    global _cloudflared_proc
+
+    bin_path = ensure_cloudflared_binary()
+    if not bin_path:
+        print("[!] TUNNEL=true nhưng không tìm được/tải được cloudflared. Bỏ qua tunnel.")
+        return
+
+    _cloudflared_proc = launch_cloudflared(bin_path)
+    threading.Thread(target=monitor_cloudflared, args=(_cloudflared_proc,), daemon=True).start()
+
+    while True:
+        time.sleep(1)
+        if _cloudflared_proc.poll() is not None:
+            print("[!] Tiến trình cloudflared dừng đột ngột, đang khởi động lại...")
+            _cloudflared_proc = launch_cloudflared(bin_path)
+            threading.Thread(target=monitor_cloudflared, args=(_cloudflared_proc,), daemon=True).start()
+
+
+def stop_tunnel():
+    if _cloudflared_proc is not None:
+        try:
+            _cloudflared_proc.terminate()
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
     if BOT_ENABLED:
         mode = "human-like (tự trả lời mọi tin)" if HUMAN_LIKE_MODE else f"chỉ trả lời khi @{BOT_NAME}"
         print(f"Bot {BOT_NAME} ENABLED - model={GEMMA_MODEL} - mode={mode}")
     else:
         print("Bot DISABLED - thieu GEMINI_API_KEY trong .env")
-    socketio.run(app, host=HOST, port=PORT, debug=False, allow_unsafe_werkzeug=True)
+
+    if TUNNEL_ENABLED:
+        threading.Thread(target=start_tunnel_and_watchdog, daemon=True).start()
+    else:
+        print("[*] TUNNEL=false - không chạy cloudflared, chỉ phục vụ nội bộ.")
+
+    try:
+        socketio.run(app, host=HOST, port=PORT, debug=False, allow_unsafe_werkzeug=True)
+    finally:
+        stop_tunnel()

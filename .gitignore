@@ -1,2 +1,6 @@
 .env
 *.db
+cloudflared
+cloudflared.exe
+/__pycache__
+config.yml
