@@ -3,3 +3,4 @@ flask-socketio
 python-dotenv
 eventlet
 google-genai
+Authlib

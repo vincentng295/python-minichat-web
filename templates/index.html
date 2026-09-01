@@ -25,6 +25,21 @@
   }
   #login-error { color: #ff6b6b; margin-top: 8px; font-size: 0.9rem; min-height: 1.2em; }
 
+  #google-login-block { display: flex; flex-direction: column; align-items: center; margin-top: 16px; }
+  #google-btn {
+    display: flex; align-items: center; gap: 10px; padding: 10px 18px; border-radius: 8px;
+    border: 1px solid #333; background: #fff; color: #222; font-size: 0.95rem; cursor: pointer;
+    text-decoration: none;
+  }
+  #google-btn img.g-icon { width: 18px; height: 18px; }
+  #or-divider { display: flex; align-items: center; gap: 10px; margin: 16px 0; color: #6c7280; font-size: 0.85rem; width: 260px; }
+  #or-divider::before, #or-divider::after { content: ""; flex: 1; height: 1px; background: #2a2e38; }
+  #google-profile { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+  #google-profile img.avatar-lg { width: 56px; height: 56px; border-radius: 50%; }
+  #google-profile .g-name { font-weight: 600; }
+  #google-profile .g-logout { font-size: 0.78rem; color: #7d8592; text-decoration: underline; cursor: pointer; }
+  .avatar-sm { width: 22px; height: 22px; border-radius: 50%; vertical-align: middle; margin-right: 4px; object-fit: cover; }
+
   #chat-screen { display: none; flex: 1; flex-direction: column; height: 100vh; }
   #topbar {
     display: flex; justify-content: space-between; align-items: center;
@@ -52,18 +67,48 @@
     padding: 0 20px; border-radius: 24px; border: none; background: #4f7cff; color: #fff; cursor: pointer; font-size: 1rem;
   }
   #bot-hint { font-size: 0.72rem; color: #6c7280; padding: 0 16px 6px; }
+
+  #reconnect-banner {
+    display: none; text-align: center; font-size: 0.8rem; padding: 6px;
+    background: #4a3a10; color: #ffcf7a;
+  }
+  #reconnect-banner.show { display: block; }
+  #login-loading { color: #9aa0ab; font-size: 0.85rem; margin-top: 10px; display: none; }
+  #login-loading.show { display: block; }
 </style>
 </head>
 <body>
 
 <div id="login-screen">
   <h1>💬 Vào phòng chat chung</h1>
+
+  {% if google_oauth_enabled %}
+    {% if google_name %}
+    <div id="google-profile">
+      {% if google_avatar %}<img class="avatar-lg" src="{{ google_avatar }}" alt="avatar">{% endif %}
+      <div class="g-name">Xin chào, {{ google_name }}</div>
+      <button id="join-google-btn" class="g-btn-primary">Tham gia bằng tài khoản Google</button>
+      <a class="g-logout" href="/logout" onclick="try{localStorage.removeItem('chat_join_info');}catch(e){}">Đăng xuất Google</a>
+    </div>
+    {% else %}
+    <div id="google-login-block">
+      <a id="google-btn" href="/login/google">
+        <img class="g-icon" src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="">
+        Đăng nhập bằng Google
+      </a>
+    </div>
+    {% endif %}
+  {% else %}
   <input id="username-input" type="text" placeholder="Nhập username của bạn..." maxlength="30" autofocus />
   <button id="join-btn">Tham gia</button>
+  {% endif %}
+
   <div id="login-error"></div>
+  <div id="login-loading">Đang kết nối lại phiên trước đó...</div>
 </div>
 
 <div id="chat-screen">
+  <div id="reconnect-banner">⚠️ Mất kết nối, đang thử kết nối lại...</div>
   <div id="topbar">
     <div class="title">💬 Phòng chat chung</div>
     <div class="users" id="user-list"></div>
@@ -83,35 +128,121 @@
 </div>
 
 <script>
-const socket = io();
+// reconnection: bật sẵn, thử lại vô hạn với backoff tăng dần
+const socket = io({
+  reconnection: true,
+  reconnectionAttempts: Infinity,
+  reconnectionDelay: 1000,
+  reconnectionDelayMax: 5000,
+});
 let myUsername = null;
+const STORAGE_KEY = 'chat_join_info'; // {type:'username', username} | {type:'google'}
 
 const loginScreen = document.getElementById('login-screen');
 const chatScreen = document.getElementById('chat-screen');
 const usernameInput = document.getElementById('username-input');
 const joinBtn = document.getElementById('join-btn');
+const joinGoogleBtn = document.getElementById('join-google-btn');
 const loginError = document.getElementById('login-error');
+const loginLoading = document.getElementById('login-loading');
+const reconnectBanner = document.getElementById('reconnect-banner');
 const messagesEl = document.getElementById('messages');
 const msgInput = document.getElementById('msg-input');
 const sendBtn = document.getElementById('send-btn');
 const userListEl = document.getElementById('user-list');
 
+function saveJoinInfo(info) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(info)); } catch (e) {}
+}
+function loadJoinInfo() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) { return null; }
+}
+function clearJoinInfo() {
+  try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
+}
+
+function emitJoin(info) {
+  if (info.type === 'google') {
+    socket.emit('join', { use_google: true });
+  } else {
+    socket.emit('join', { username: info.username });
+  }
+}
+
 function doJoin() {
   const name = usernameInput.value.trim();
   if (!name) { loginError.textContent = 'Vui lòng nhập username.'; return; }
-  socket.emit('join', { username: name });
+  loginError.textContent = '';
+  emitJoin({ type: 'username', username: name });
 }
-joinBtn.addEventListener('click', doJoin);
-usernameInput.addEventListener('keydown', e => { if (e.key === 'Enter') doJoin(); });
+if (joinBtn) {
+  joinBtn.addEventListener('click', doJoin);
+  usernameInput.addEventListener('keydown', e => { if (e.key === 'Enter') doJoin(); });
+}
+if (joinGoogleBtn) {
+  joinGoogleBtn.addEventListener('click', () => {
+    loginError.textContent = '';
+    emitJoin({ type: 'google' });
+  });
+}
 
-socket.on('join_error', data => { loginError.textContent = data.error; });
+// Kết nối lần đầu (hoặc sau khi rớt mạng): nếu có phiên đã lưu, tự động join lại
+// mà không cần người dùng bấm nút - vừa để duy trì đăng nhập khi reload trang,
+// vừa để khôi phục lại phòng chat khi socket reconnect (sid đổi -> phải join lại).
+socket.on('connect', () => {
+  reconnectBanner.classList.remove('show');
+  const saved = loadJoinInfo();
+  if (saved && !myUsername) {
+    loginLoading.classList.add('show');
+    emitJoin(saved);
+  } else if (saved && myUsername) {
+    // đã từng join (đang reconnect giữa phiên) -> join lại ngay để vào lại room
+    emitJoin(saved);
+  }
+});
+
+socket.on('disconnect', () => {
+  if (chatScreen.style.display === 'flex') {
+    reconnectBanner.classList.add('show');
+  }
+});
+
+socket.on('join_error', data => {
+  loginLoading.classList.remove('show');
+  loginError.textContent = data.error;
+  clearJoinInfo();
+});
 
 socket.on('joined', data => {
   myUsername = data.username;
+  loginLoading.classList.remove('show');
   loginScreen.style.display = 'none';
   chatScreen.style.display = 'flex';
+  reconnectBanner.classList.remove('show');
   msgInput.focus();
 });
+
+// Ghi lại lựa chọn NGAY khi người dùng bấm nút (trước khi có phản hồi 'joined'),
+// để nếu load lại trang giữa chừng vẫn còn thông tin để tự nối lại.
+if (joinBtn) joinBtn.addEventListener('click', () => {
+  const name = usernameInput.value.trim();
+  if (name) saveJoinInfo({ type: 'username', username: name });
+});
+if (joinGoogleBtn) joinGoogleBtn.addEventListener('click', () => saveJoinInfo({ type: 'google' }));
+
+// Nếu trang vừa tải và đã có phiên lưu từ trước, thử tự động join ngay cả khi
+// socket 'connect' đã bắn ra trước khi các listener này được gắn (hiếm khi xảy ra
+// nhưng để chắc chắn, kiểm tra socket.connected ngay lúc khởi tạo).
+(function tryAutoJoinOnLoad() {
+  const saved = loadJoinInfo();
+  if (saved) {
+    loginLoading.classList.add('show');
+    if (socket.connected) emitJoin(saved);
+  }
+})();
 
 socket.on('history', data => {
   messagesEl.innerHTML = '';
@@ -125,8 +256,17 @@ socket.on('new_message', msg => {
 });
 
 socket.on('user_list', data => {
-  userListEl.textContent = 'Đang online: ' + data.users.join(', ');
+  userListEl.innerHTML = 'Đang online: ' + data.users.map(u => {
+    const avatarImg = u.avatar ? `<img class="avatar-sm" src="${u.avatar}" alt="">` : '';
+    return avatarImg + escapeHtml(u.username);
+  }).join(', ');
 });
+
+function escapeHtml(str) {
+  const d = document.createElement('div');
+  d.textContent = str;
+  return d.innerHTML;
+}
 
 function renderMessage(msg) {
   const div = document.createElement('div');
@@ -139,7 +279,8 @@ function renderMessage(msg) {
     div.className = 'msg ' + (isBot ? 'bot' : (isMine ? 'mine' : 'other'));
     const meta = document.createElement('div');
     meta.className = 'meta';
-    meta.textContent = (isBot ? '🤖 ' : '') + msg.user;
+    meta.innerHTML = (msg.avatar ? `<img class="avatar-sm" src="${msg.avatar}" alt="">` : '') +
+      (isBot ? '🤖 ' : '') + escapeHtml(msg.user);
     const body = document.createElement('div');
     body.textContent = msg.text;
     div.appendChild(meta);

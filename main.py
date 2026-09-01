@@ -6,9 +6,10 @@ import sqlite3
 import threading
 import subprocess
 import importlib
-from flask import Flask, render_template, request, session
+from flask import Flask, render_template, request, session, redirect, url_for
 from flask_socketio import SocketIO, emit, join_room
 from dotenv import load_dotenv
+from authlib.integrations.flask_client import OAuth
 from google import genai
 from google.genai import types
 
@@ -31,6 +32,13 @@ BOT_ENABLE_GOOGLE_SEARCH = os.getenv("BOT_ENABLE_GOOGLE_SEARCH", "false").strip(
 
 HOST = os.getenv("HOST", "127.99.128.39")
 PORT = int(os.getenv("PORT", "8888"))
+
+# =========================================
+# Google OAuth (tuỳ chọn - không bắt buộc)
+# =========================================
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
+GOOGLE_OAUTH_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
 
 # Giới hạn lưu trữ - cấu hình qua .env
 MAX_HISTORY = int(os.getenv("MAX_HISTORY_MESSAGES", "20000"))
@@ -85,8 +93,20 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", uuid.uuid4().hex)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
+oauth = OAuth(app)
+if GOOGLE_OAUTH_ENABLED:
+    oauth.register(
+        name="google",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
+        client_kwargs={"scope": "openid email profile"},
+    )
+else:
+    print("[*] GOOGLE_CLIENT_ID/SECRET chưa thiết lập - đăng nhập Google bị tắt (không bắt buộc).")
+
 ROOM = "main"
-online_users = {}       # sid -> username
+online_users = {}       # sid -> {"username": str, "avatar": str|None}
 db_lock = threading.Lock()
 bot_lock = threading.Lock()
 last_bot_reply_ts = 0.0
@@ -115,11 +135,15 @@ def init_db():
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts)")
+        # Migration: thêm cột avatar cho DB cũ (tạo trước khi có tính năng Google OAuth)
+        existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(messages)")}
+        if "avatar" not in existing_cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN avatar TEXT")
         conn.commit()
         conn.close()
 
 
-def add_message(user, text, mtype="chat"):
+def add_message(user, text, mtype="chat", avatar=None):
     text = text[:MAX_MESSAGE_LENGTH]
     msg = {
         "id": uuid.uuid4().hex,
@@ -127,12 +151,13 @@ def add_message(user, text, mtype="chat"):
         "text": text,
         "ts": now_ts(),
         "type": mtype,  # chat | system | bot
+        "avatar": avatar,
     }
     with db_lock:
         conn = get_db()
         conn.execute(
-            "INSERT INTO messages (id, user, text, ts, type) VALUES (?, ?, ?, ?, ?)",
-            (msg["id"], msg["user"], msg["text"], msg["ts"], msg["type"]),
+            "INSERT INTO messages (id, user, text, ts, type, avatar) VALUES (?, ?, ?, ?, ?, ?)",
+            (msg["id"], msg["user"], msg["text"], msg["ts"], msg["type"], msg["avatar"]),
         )
         # Giữ tối đa MAX_HISTORY tin nhắn - xoá bớt tin cũ nhất khi vượt ngưỡng
         conn.execute("""
@@ -151,7 +176,7 @@ def load_recent_messages(limit=None, for_display=False):
     with db_lock:
         conn = get_db()
         rows = conn.execute(
-            "SELECT id, user, text, ts, type FROM messages ORDER BY ts DESC LIMIT ?",
+            "SELECT id, user, text, ts, type, avatar FROM messages ORDER BY ts DESC LIMIT ?",
             (limit,),
         ).fetchall()
         conn.close()
@@ -237,17 +262,71 @@ def index():
         bot_name=BOT_NAME,
         max_message_length=MAX_MESSAGE_LENGTH,
         human_like_mode=HUMAN_LIKE_MODE,
+        google_oauth_enabled=GOOGLE_OAUTH_ENABLED,
+        google_name=session.get("google_name"),
+        google_avatar=session.get("google_avatar"),
     )
+
+
+@app.route("/login/google")
+def login_google():
+    """Bắt đầu luồng OAuth với Google. Đây là tính năng TUỲ CHỌN - người
+    dùng vẫn có thể vào phòng chat bằng username thường mà không cần login."""
+    if not GOOGLE_OAUTH_ENABLED:
+        return "Đăng nhập Google chưa được cấu hình trên server này.", 404
+    redirect_uri = url_for("google_callback", _external=True)
+    return oauth.google.authorize_redirect(redirect_uri)
+
+
+@app.route("/login/google/callback")
+def google_callback():
+    if not GOOGLE_OAUTH_ENABLED:
+        return "Đăng nhập Google chưa được cấu hình trên server này.", 404
+    try:
+        token = oauth.google.authorize_access_token()
+        userinfo = token.get("userinfo") or {}
+    except Exception as e:
+        print("Google OAuth callback lỗi:", e)
+        return redirect(url_for("index"))
+
+    session["google_id"] = userinfo.get("sub")
+    session["google_name"] = (userinfo.get("name") or userinfo.get("email") or "Google User")[:30]
+    session["google_avatar"] = userinfo.get("picture")
+    session["google_email"] = userinfo.get("email")
+    return redirect(url_for("index"))
+
+
+@app.route("/logout")
+def logout():
+    """Đăng xuất khỏi Google (chỉ xoá session OAuth, không ảnh hưởng tới
+    việc vào phòng chat bằng username thường)."""
+    session.pop("google_id", None)
+    session.pop("google_name", None)
+    session.pop("google_avatar", None)
+    session.pop("google_email", None)
+    return redirect(url_for("index"))
 
 
 @socketio.on("join")
 def on_join(data):
-    username = (data.get("username") or "").strip()[:30]
-    if not username:
-        emit("join_error", {"error": "Tên không hợp lệ."})
-        return
+    data = data or {}
+
+    # Tuỳ chọn: nếu client đã đăng nhập Google (session có sẵn từ luồng OAuth)
+    # và yêu cầu dùng danh tính Google, ưu tiên tên + avatar từ Google.
+    # Nếu không, dùng username tự nhập như trước (hành vi mặc định, không đổi).
+    use_google = bool(data.get("use_google")) and bool(session.get("google_name"))
+    if use_google:
+        username = session["google_name"]
+        avatar = session.get("google_avatar")
+    else:
+        username = (data.get("username") or "").strip()[:30]
+        avatar = None
+        if not username:
+            emit("join_error", {"error": "Tên không hợp lệ."})
+            return
+
     # ensure uniqueness by appending suffix if taken
-    existing = set(online_users.values())
+    existing = {info["username"] for info in online_users.values()}
     base = username
     suffix = 1
     while username in existing:
@@ -255,10 +334,10 @@ def on_join(data):
         username = f"{base}{suffix}"
 
     session["username"] = username
-    online_users[request.sid] = username
+    online_users[request.sid] = {"username": username, "avatar": avatar}
     join_room(ROOM)
 
-    emit("joined", {"username": username})
+    emit("joined", {"username": username, "avatar": avatar})
     emit("history", {"messages": load_recent_messages(for_display=True)})
     emit("user_list", {"users": list(online_users.values())}, room=ROOM)
     sys_msg = add_message("system", f"{username} đã tham gia phòng chat.", "system")
@@ -267,8 +346,9 @@ def on_join(data):
 
 @socketio.on("disconnect")
 def on_disconnect():
-    username = online_users.pop(request.sid, None)
-    if username:
+    info = online_users.pop(request.sid, None)
+    if info:
+        username = info["username"]
         emit("user_list", {"users": list(online_users.values())}, room=ROOM)
         sys_msg = add_message("system", f"{username} đã rời phòng chat.", "system")
         emit("new_message", sys_msg, room=ROOM)
@@ -276,14 +356,16 @@ def on_disconnect():
 
 @socketio.on("chat_message")
 def on_chat_message(data):
-    username = online_users.get(request.sid)
-    if not username:
+    info = online_users.get(request.sid)
+    if not info:
         return
+    username = info["username"]
+    avatar = info.get("avatar")
     text = (data.get("text") or "").strip()
     if not text:
         return
     text = text[:MAX_MESSAGE_LENGTH]
-    msg = add_message(username, text, "chat")
+    msg = add_message(username, text, "chat", avatar=avatar)
     emit("new_message", msg, room=ROOM)
 
     mentioned = BOT_ENABLED and (
