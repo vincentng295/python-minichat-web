@@ -53,6 +53,7 @@
   }
   .msg { max-width: 75%; padding: 8px 12px; border-radius: 12px; line-height: 1.35; word-wrap: break-word; }
   .msg .meta { font-size: 0.72rem; color: #9aa0ab; margin-bottom: 2px; }
+  .msg .msg-time { color: #6b7280; opacity: 0.85; }
   .msg.mine { align-self: flex-end; background: #4f7cff; color: #fff; }
   .msg.other { align-self: flex-start; background: #1e222b; }
   .msg.bot { align-self: flex-start; background: #2a1f3d; border: 1px solid #7c4dff55; }
@@ -268,6 +269,17 @@ function escapeHtml(str) {
   return d.innerHTML;
 }
 
+function formatLocalTime(unixTs) {
+  if (!unixTs) return '';
+  const d = new Date(unixTs * 1000); // server gửi unix time (giây, UTC) -> Date tự quy đổi sang giờ local của trình duyệt
+  const now = new Date();
+  const sameDay = d.toDateString() === now.toDateString();
+  const timePart = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  if (sameDay) return timePart;
+  const datePart = d.toLocaleDateString(undefined, { day: '2-digit', month: '2-digit', year: 'numeric' });
+  return `${datePart} ${timePart}`;
+}
+
 function renderMessage(msg) {
   const div = document.createElement('div');
   if (msg.type === 'system') {
@@ -280,7 +292,8 @@ function renderMessage(msg) {
     const meta = document.createElement('div');
     meta.className = 'meta';
     meta.innerHTML = (msg.avatar ? `<img class="avatar-sm" src="${msg.avatar}" alt="">` : '') +
-      (isBot ? '🤖 ' : '') + escapeHtml(msg.user);
+      (isBot ? '🤖 ' : '') + escapeHtml(msg.user) +
+      ` <span class="msg-time" title="${new Date((msg.ts || 0) * 1000).toISOString()}">${formatLocalTime(msg.ts)}</span>`;
     const body = document.createElement('div');
     body.textContent = msg.text;
     div.appendChild(meta);
@@ -298,6 +311,8 @@ let lastSentAt = 0;
 function sendMessage() {
   const text = msgInput.value.trim();
   if (!text) return;
+  // Chặn gửi trùng: cùng nội dung trong vòng 1.5s (do Enter bắn 2 keydown khi
+  // dùng IME, hoặc bấm Enter + chạm nút Gửi gần như cùng lúc trên mobile).
   const nowMs = Date.now();
   if (text === lastSentText && nowMs - lastSentAt < 1500) return;
   lastSentText = text;
@@ -307,6 +322,8 @@ function sendMessage() {
 }
 sendBtn.addEventListener('click', sendMessage);
 msgInput.addEventListener('keydown', e => {
+  // isComposing/keyCode 229 = phím Enter đến từ IME đang gõ dở, bỏ qua để
+  // tránh gửi 2 lần (1 lần compose + 1 lần confirm thật).
   if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) sendMessage();
 });
 </script>

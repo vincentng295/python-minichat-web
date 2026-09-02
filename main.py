@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import subprocess
 import importlib
+from datetime import datetime, timezone
 from flask import Flask, render_template, request, session, redirect, url_for, send_file, abort
 from flask_socketio import SocketIO, emit, join_room
 from dotenv import load_dotenv
@@ -293,16 +294,28 @@ def avatar_bot():
         max_age=3600,
     )
 
-def call_gemma(prompt, history_context):
-    """Gọi model Gemma qua SDK google-genai (client.models.generate_content)."""
+def format_utc(ts):
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def call_gemma(history_context):
+    """Gọi model Gemma qua SDK google-genai (client.models.generate_content).
+    history_context: danh sách tin nhắn gần nhất (đã bao gồm tin nhắn mới nhất
+    kích hoạt bot trả lời, vì nó được lưu vào DB trước khi tác vụ nền này chạy)."""
     if not BOT_ENABLED or genai_client is None:
         return None
 
+    now_utc_str = format_utc(now_ts())
     default_note = (
         "Bạn là một người tham gia trò chuyện tên là '%s' trong một phòng chat "
-        "công cộng nhiều người. Trả lời ngắn gọn, tự nhiên, thân thiện bằng "
-        "tiếng Việt (trừ khi được hỏi bằng ngôn ngữ khác). Không cần lặp lại câu hỏi."
-        % BOT_NAME
+        "công cộng nhiều người. Thời điểm hiện tại là %s. Mỗi tin nhắn trong "
+        "lịch sử dưới đây được đánh dấu mốc thời gian ở đầu dòng theo định dạng "
+        "[unix_ts | ngày giờ UTC] - dùng nó để biết tin nào cũ/mới hoặc khoảng "
+        "cách thời gian giữa các tin nếu cần, KHÔNG phải là nội dung người dùng "
+        "gõ. Trả lời ngắn gọn, tự nhiên, thân thiện bằng tiếng Việt (trừ khi "
+        "được hỏi bằng ngôn ngữ khác). Không cần lặp lại câu hỏi, và chỉ nhắc "
+        "tới thời gian khi được hỏi trực tiếp."
+        % (BOT_NAME, now_utc_str)
     )
     if BOT_CUSTOM_INSTRUCTION:
         # Nội dung instruction.txt được inject vào đầu system instruction
@@ -313,9 +326,14 @@ def call_gemma(prompt, history_context):
     contents = []
     for h in history_context[-10:]:
         role = "model" if h["type"] == "bot" else "user"
-        text = f"{h['user']}: {h['text']}" if role == "user" else h["text"]
+        ts_prefix = f"[{int(h['ts'])} | {format_utc(h['ts'])}] "
+        text = f"{ts_prefix}{h['user']}: {h['text']}" if role == "user" else f"{ts_prefix}{h['text']}"
         contents.append(types.Content(role=role, parts=[types.Part.from_text(text=text)]))
-    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=prompt)]))
+    # LƯU Ý: KHÔNG append thêm tin nhắn hiện tại riêng nữa ở đây - nó đã nằm
+    # sẵn trong history_context (được lưu DB trước khi tác vụ bot bắt đầu chạy).
+    # Trước đây có bug append trùng khiến model nhận được cùng 1 câu 2 lần.
+    if not contents:
+        return None
 
     config_kwargs = {
         "temperature": BOT_TEMPERATURE,
@@ -547,7 +565,7 @@ def try_reserve_bot_slot():
 def handle_bot_reply(username, text):
     socketio.sleep(0.3)
     recent_context = load_recent_messages(limit=10)
-    reply = call_gemma(f"{username}: {text}", recent_context)
+    reply = call_gemma(recent_context)
     if reply:
         bot_msg = add_message(BOT_NAME, reply, "bot", avatar=BOT_AVATAR_URL)
         # DB vẫn lưu type="bot" để phân biệt role khi xây ngữ cảnh cho model;
