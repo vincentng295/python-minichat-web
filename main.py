@@ -107,7 +107,7 @@ genai_client = (
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", uuid.uuid4().hex)
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 oauth = OAuth(app)
 if GOOGLE_OAUTH_ENABLED:
@@ -694,10 +694,16 @@ if __name__ == "__main__":
         socketio.run(app, host=HOST, port=PORT, debug=False, allow_unsafe_werkzeug=True)
     except KeyboardInterrupt:
         print("\n[*] Nhận Ctrl+C - đang thoát chương trình...")
-    finally:
         stop_tunnel()
         # Một số async mode (eventlet/gevent) có thể giữ lại greenlet/thread nền
         # sau khi socketio.run() trả về, khiến tiến trình không thoát hẳn dù đã
-        # bắt được KeyboardInterrupt. os._exit() buộc thoát ngay lập tức, bỏ qua
-        # mọi cleanup Python bình thường (đã chạy xong ở finally phía trên rồi).
+        # bắt được KeyboardInterrupt. os._exit() buộc thoát ngay lập tức.
+        # CHỈ áp dụng cho nhánh Ctrl+C này - lỗi thật (bind cổng thất bại, sai
+        # tham số, v.v.) phải được để traceback in ra bình thường bên dưới,
+        # không được nuốt mất.
         os._exit(0)
+    except Exception:
+        stop_tunnel()
+        raise
+    else:
+        stop_tunnel()
