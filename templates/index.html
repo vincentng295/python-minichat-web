@@ -76,6 +76,11 @@
   #reconnect-banner.show { display: block; }
   #login-loading { color: #9aa0ab; font-size: 0.85rem; margin-top: 10px; display: none; }
   #login-loading.show { display: block; }
+
+  #popup-blocked-hint {
+    color: #ffcf7a; font-size: 0.8rem; margin-top: 10px; max-width: 280px; text-align: center; display: none;
+  }
+  #popup-blocked-hint.show { display: block; }
 </style>
 </head>
 <body>
@@ -93,10 +98,14 @@
     </div>
     {% else %}
     <div id="google-login-block">
-      <a id="google-btn" href="/login/google">
+      <a id="google-btn" href="/login/google" data-popup-href="/login/google?popup=1">
         <img class="g-icon" src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" alt="">
         Đăng nhập bằng Google
       </a>
+      <div id="popup-blocked-hint">
+        Trình duyệt đã chặn cửa sổ đăng nhập. Vui lòng cho phép popup cho trang này, hoặc
+        <a href="/login/google" target="_blank" rel="noopener">mở đăng nhập ở tab mới</a>.
+      </div>
     </div>
     {% endif %}
   {% else %}
@@ -144,6 +153,8 @@ const chatScreen = document.getElementById('chat-screen');
 const usernameInput = document.getElementById('username-input');
 const joinBtn = document.getElementById('join-btn');
 const joinGoogleBtn = document.getElementById('join-google-btn');
+const googleBtn = document.getElementById('google-btn');
+const popupBlockedHint = document.getElementById('popup-blocked-hint');
 const loginError = document.getElementById('login-error');
 const loginLoading = document.getElementById('login-loading');
 const reconnectBanner = document.getElementById('reconnect-banner');
@@ -151,6 +162,62 @@ const messagesEl = document.getElementById('messages');
 const msgInput = document.getElementById('msg-input');
 const sendBtn = document.getElementById('send-btn');
 const userListEl = document.getElementById('user-list');
+
+// ---------------------------------------------------------------
+// Đăng nhập Google khi trang đang bị nhúng trong iframe: Google chặn
+// luồng OAuth chạy trực tiếp bên trong iframe (chống clickjacking), nên
+// nếu phát hiện window.self !== window.top, ta mở link đăng nhập bằng
+// window.open() (cửa sổ popup, là 1 top-level browsing context thật sự -
+// không bị Google chặn), thay vì để iframe tự điều hướng tới Google.
+// Sau khi popup đăng nhập xong, server trả về 1 trang nhỏ tự đóng popup
+// và postMessage báo cho window.opener (chính là trang trong iframe này) -
+// lúc đó ta chỉ cần reload trang (cùng domain, không đụng Google nữa nên
+// không bị chặn) để lấy lại session đã đăng nhập.
+// ---------------------------------------------------------------
+const isEmbedded = (function () {
+  try { return window.self !== window.top; } catch (e) { return true; } // lỗi truy cập -> coi như bị nhúng (cross-origin)
+})();
+
+let googleLoginPopup = null;
+
+function openGoogleLoginPopup() {
+  loginError.textContent = '';
+  popupBlockedHint.classList.remove('show');
+  const w = 480, h = 640;
+  const left = (window.screenX || 0) + Math.max(0, ((window.outerWidth || w) - w) / 2);
+  const top = (window.screenY || 0) + Math.max(0, ((window.outerHeight || h) - h) / 2);
+  googleLoginPopup = window.open(
+    googleBtn.getAttribute('data-popup-href'),
+    'google_login_popup',
+    `width=${w},height=${h},left=${left},top=${top}`
+  );
+  if (!googleLoginPopup) {
+    // Trình duyệt chặn popup (thường do không được kích hoạt trực tiếp từ
+    // click của người dùng) -> chỉ còn cách mời người dùng tự mở tab mới.
+    popupBlockedHint.classList.add('show');
+  }
+}
+
+window.addEventListener('message', (event) => {
+  if (!event.data || typeof event.data !== 'object') return;
+  if (event.data.type === 'google-login-success') {
+    // Session đã có thông tin Google (cùng origin, cookie đã set qua popup) -
+    // reload để server render lại login-screen với nút "Tham gia bằng Google".
+    location.reload();
+  } else if (event.data.type === 'google-login-error') {
+    loginError.textContent = 'Đăng nhập Google thất bại, vui lòng thử lại.';
+  }
+});
+
+if (googleBtn && isEmbedded) {
+  googleBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    openGoogleLoginPopup();
+  });
+}
+// Khi KHÔNG bị nhúng (mở trực tiếp/tab riêng), giữ nguyên hành vi cũ:
+// #google-btn vẫn là link <a href="/login/google"> điều hướng bình thường,
+// không cần popup vì không có gì chặn cả.
 
 function saveJoinInfo(info) {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(info)); } catch (e) {}

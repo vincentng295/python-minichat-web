@@ -393,17 +393,47 @@ def index():
 @app.route("/login/google")
 def login_google():
     """Bắt đầu luồng OAuth với Google. Đây là tính năng TUỲ CHỌN - người
-    dùng vẫn có thể vào phòng chat bằng username thường mà không cần login."""
+    dùng vẫn có thể vào phòng chat bằng username thường mà không cần login.
+
+    ?popup=1: đánh dấu luồng này được mở từ 1 cửa sổ popup (window.open),
+    dùng khi trang chat đang bị nhúng trong iframe - Google chặn OAuth chạy
+    trực tiếp trong iframe nên phải mở popup (top-level window) riêng. Cờ
+    này được lưu vào session để /login/google/callback biết cách trả về
+    (đóng popup + báo cho trang cha) thay vì redirect thẳng."""
     if not GOOGLE_OAUTH_ENABLED:
         return "Đăng nhập Google chưa được cấu hình trên server này.", 404
+    session["_google_login_popup"] = (request.args.get("popup") == "1")
     redirect_uri = url_for("google_callback", _external=True)
     return oauth.google.authorize_redirect(redirect_uri)
+
+
+def _popup_close_response(success):
+    """Trang nhỏ để đóng popup đăng nhập Google và báo kết quả về cho
+    window.opener (trang chat gốc, có thể đang nằm trong iframe) qua
+    postMessage. Dùng khi đăng nhập được khởi động với ?popup=1."""
+    status = "google-login-success" if success else "google-login-error"
+    text = "Đăng nhập thành công, đang đóng cửa sổ..." if success else "Đăng nhập thất bại, đang đóng cửa sổ..."
+    html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body>
+<p style="font-family:sans-serif;color:#666;text-align:center;margin-top:40px;">{text}</p>
+<script>
+  try {{
+    if (window.opener) {{
+      window.opener.postMessage({{ type: "{status}" }}, "*");
+    }}
+  }} catch (e) {{}}
+  window.close();
+</script>
+</body></html>"""
+    return html
 
 
 @app.route("/login/google/callback")
 def google_callback():
     if not GOOGLE_OAUTH_ENABLED:
         return "Đăng nhập Google chưa được cấu hình trên server này.", 404
+
+    is_popup = session.pop("_google_login_popup", False)
+
     try:
         token = oauth.google.authorize_access_token()
         # authlib đã tự verify chữ ký (qua JWKS của Google), issuer, audience và
@@ -423,6 +453,8 @@ def google_callback():
 
     except Exception as e:
         print("Google OAuth callback lỗi:", e)
+        if is_popup:
+            return _popup_close_response(False)
         return redirect(url_for("index"))
 
     # Định danh gốc = "sub" lấy từ ID Token đã verify, KHÔNG phải tên hiển thị.
@@ -433,6 +465,9 @@ def google_callback():
     session["google_avatar"] = claims.get("picture")
     session["google_email"] = claims.get("email")
     session["google_id_exp"] = claims.get("exp")  # hết hạn của chính ID Token (unix ts)
+
+    if is_popup:
+        return _popup_close_response(True)
     return redirect(url_for("index"))
 
 
