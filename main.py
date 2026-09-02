@@ -127,6 +127,8 @@ online_users = {}       # sid -> {"username": str, "avatar": str|None}
 db_lock = threading.Lock()
 bot_lock = threading.Lock()
 last_bot_reply_ts = 0.0
+pending_lock = threading.Lock()
+pending_bot_retry_scheduled = False  # tránh lên lịch nhiều task retry trùng nhau
 
 
 def now_ts():
@@ -557,8 +559,13 @@ def on_chat_message(data):
         f"@{BOT_NAME.lower()}" in text.lower() or BOT_NAME.lower() in text.lower()
     )
     should_reply = BOT_ENABLED and (HUMAN_LIKE_MODE or mentioned)
-    if should_reply and try_reserve_bot_slot():
-        socketio.start_background_task(handle_bot_reply, username, text)
+    if should_reply:
+        if try_reserve_bot_slot():
+            socketio.start_background_task(handle_bot_reply, username, text)
+        else:
+            # Đang trong cooldown: không bỏ qua tin nhắn này luôn, mà lên lịch
+            # kiểm tra lại ngay khi cooldown kết thúc để trả lời tiếp.
+            schedule_bot_retry()
 
 
 def try_reserve_bot_slot():
@@ -571,6 +578,37 @@ def try_reserve_bot_slot():
             return False
         last_bot_reply_ts = now
         return True
+
+
+def schedule_bot_retry():
+    """Lên lịch 1 task nền chờ hết cooldown rồi thử trả lời lại, để tin nhắn
+    đến trong lúc cooldown không bị bot im lặng bỏ qua. Dùng pending_lock để
+    đảm bảo chỉ có 1 task retry đang chờ tại một thời điểm (nhiều tin nhắn
+    đến dồn dập trong cooldown chỉ cần 1 lần kiểm tra lại sau khi hết cooldown)."""
+    global pending_bot_retry_scheduled
+    with pending_lock:
+        if pending_bot_retry_scheduled:
+            return
+        pending_bot_retry_scheduled = True
+    socketio.start_background_task(_bot_retry_task)
+
+
+def _bot_retry_task():
+    global pending_bot_retry_scheduled
+    with bot_lock:
+        wait = BOT_REPLY_COOLDOWN_SECONDS - (now_ts() - last_bot_reply_ts)
+    if wait > 0:
+        socketio.sleep(wait)
+
+    with pending_lock:
+        pending_bot_retry_scheduled = False
+
+    if try_reserve_bot_slot():
+        recent = load_recent_messages(limit=1)
+        last = recent[-1] if recent else None
+        username = last["user"] if last else BOT_NAME
+        text = last["text"] if last else ""
+        socketio.start_background_task(handle_bot_reply, username, text)
 
 
 def handle_bot_reply(username, text):
