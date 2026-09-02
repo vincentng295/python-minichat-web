@@ -298,8 +298,6 @@ let lastSentAt = 0;
 function sendMessage() {
   const text = msgInput.value.trim();
   if (!text) return;
-  // Chặn gửi trùng: cùng nội dung trong vòng 1.5s (do Enter bắn 2 keydown khi
-  // dùng IME, hoặc bấm Enter + chạm nút Gửi gần như cùng lúc trên mobile).
   const nowMs = Date.now();
   if (text === lastSentText && nowMs - lastSentAt < 1500) return;
   lastSentText = text;
@@ -309,8 +307,6 @@ function sendMessage() {
 }
 sendBtn.addEventListener('click', sendMessage);
 msgInput.addEventListener('keydown', e => {
-  // isComposing/keyCode 229 = phím Enter đến từ IME đang gõ dở, bỏ qua để
-  // tránh gửi 2 lần (1 lần compose + 1 lần confirm thật).
   if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) sendMessage();
 });
 </script>

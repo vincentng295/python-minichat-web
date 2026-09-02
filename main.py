@@ -375,15 +375,33 @@ def google_callback():
         return "Đăng nhập Google chưa được cấu hình trên server này.", 404
     try:
         token = oauth.google.authorize_access_token()
-        userinfo = token.get("userinfo") or {}
+        # authlib đã tự verify chữ ký (qua JWKS của Google), issuer, audience và
+        # nonce của ID Token khi gọi authorize_access_token() ở trên (vì scope có
+        # "openid"). Claims đã-verify nằm sẵn trong token["userinfo"].
+        claims = token.get("userinfo") or {}
+        if not claims:
+            raise ValueError("Không lấy được claims từ ID Token.")
+
+        sub = claims.get("sub")  # claim định danh DUY NHẤT, bất biến của tài khoản Google
+        if not sub:
+            raise ValueError("ID Token thiếu claim 'sub'.")
+
+        # Chặn tài khoản Google chưa xác minh email mạo danh người khác qua email.
+        if claims.get("email") and not claims.get("email_verified", True):
+            raise ValueError("Email Google chưa được xác minh.")
+
     except Exception as e:
         print("Google OAuth callback lỗi:", e)
         return redirect(url_for("index"))
 
-    session["google_id"] = userinfo.get("sub")
-    session["google_name"] = (userinfo.get("name") or userinfo.get("email") or "Google User")[:30]
-    session["google_avatar"] = userinfo.get("picture")
-    session["google_email"] = userinfo.get("email")
+    # Định danh gốc = "sub" lấy từ ID Token đã verify, KHÔNG phải tên hiển thị.
+    # Tên hiển thị/avatar chỉ là thông tin trình bày, có thể trùng nhau giữa
+    # nhiều "sub" khác nhau nên không được dùng để nhận diện người dùng.
+    session["google_id"] = sub
+    session["google_name"] = (claims.get("name") or claims.get("email") or "Google User")[:30]
+    session["google_avatar"] = claims.get("picture")
+    session["google_email"] = claims.get("email")
+    session["google_id_exp"] = claims.get("exp")  # hết hạn của chính ID Token (unix ts)
     return redirect(url_for("index"))
 
 
@@ -395,6 +413,7 @@ def logout():
     session.pop("google_name", None)
     session.pop("google_avatar", None)
     session.pop("google_email", None)
+    session.pop("google_id_exp", None)
     return redirect(url_for("index"))
 
 
@@ -405,8 +424,15 @@ def on_join(data):
     # Tuỳ chọn: nếu client đã đăng nhập Google (session có sẵn từ luồng OAuth)
     # và yêu cầu dùng danh tính Google, ưu tiên tên + avatar từ Google.
     # Nếu không, dùng username tự nhập như trước (hành vi mặc định, không đổi).
-    use_google = bool(data.get("use_google")) and bool(session.get("google_name"))
+    use_google = bool(data.get("use_google")) and bool(session.get("google_id"))
     if use_google:
+        # Token JWT có hạn dùng riêng (claim "exp") độc lập với session Flask.
+        # Nếu đã hết hạn, bắt đăng nhập lại thay vì tin tưởng session cũ.
+        exp = session.get("google_id_exp")
+        if exp and now_ts() > exp:
+            emit("join_error", {"error": "Phiên đăng nhập Google đã hết hạn, vui lòng đăng nhập lại."})
+            return
+        identity_id = f"google:{session['google_id']}"  # định danh gốc bất biến (claim sub)
         username = session["google_name"]
         avatar = session.get("google_avatar")
     else:
@@ -415,9 +441,30 @@ def on_join(data):
         if not username:
             emit("join_error", {"error": "Tên không hợp lệ."})
             return
+        # Khách vãng lai: định danh gắn theo sid, KHÔNG dùng tên hiển thị làm
+        # định danh, để không thể tự nhận trùng "sub" của tài khoản đã xác thực.
+        identity_id = f"guest:{request.sid}"
 
-    # ensure uniqueness by appending suffix if taken
-    existing = {info["username"] for info in online_users.values()}
+    # Nếu chính danh tính này (cùng sub Google) đang có 1 kết nối cũ còn treo
+    # (ví dụ mất mạng đột ngột chưa kịp bắn 'disconnect'), dọn kết nối cũ đó đi
+    # và tái sử dụng NGUYÊN tên cũ - tránh vừa bị đổi tên vừa spam tin
+    # "rời phòng/tham gia phòng" liên tục khi mạng chập chờn.
+    stale_sid = next(
+        (sid for sid, info in online_users.items()
+         if info.get("identity_id") == identity_id and sid != request.sid),
+        None,
+    )
+    if stale_sid is not None:
+        online_users.pop(stale_sid, None)
+        if use_google:
+            username = session["google_name"]  # giữ nguyên tên gốc, bỏ qua suffix cũ
+
+    # Chống giả mạo: username tự nhập không được trùng tên hiển thị của một
+    # danh tính Google (identity_id khác) đang online.
+    existing = {
+        info["username"] for sid, info in online_users.items()
+        if sid != request.sid and info.get("identity_id") != identity_id
+    }
     base = username
     suffix = 1
     while username in existing:
@@ -425,14 +472,20 @@ def on_join(data):
         username = f"{base}{suffix}"
 
     session["username"] = username
-    online_users[request.sid] = {"username": username, "avatar": avatar}
+    online_users[request.sid] = {"username": username, "avatar": avatar, "identity_id": identity_id}
     join_room(ROOM)
 
     emit("joined", {"username": username, "avatar": avatar})
     emit("history", {"messages": load_recent_messages(for_display=True)})
-    emit("user_list", {"users": list(online_users.values())}, room=ROOM)
-    sys_msg = add_message("system", f"{username} đã tham gia phòng chat.", "system")
-    emit("new_message", sys_msg, room=ROOM)
+    emit("user_list", {"users": [
+        {"username": i["username"], "avatar": i["avatar"]} for i in online_users.values()
+    ]}, room=ROOM)
+    if stale_sid is None:
+        # Chỉ thông báo "đã tham gia" khi đây thực sự là lượt vào phòng mới,
+        # không phải reconnect nối lại kết nối cũ vừa dọn ở trên.
+        sys_msg = add_message("system", f"{username} đã tham gia phòng chat.", "system")
+        emit("new_message", sys_msg, room=ROOM)
+
 
 
 @socketio.on("disconnect")
@@ -443,6 +496,9 @@ def on_disconnect():
         emit("user_list", {"users": list(online_users.values())}, room=ROOM)
         sys_msg = add_message("system", f"{username} đã rời phòng chat.", "system")
         emit("new_message", sys_msg, room=ROOM)
+
+
+_last_msg_by_user = {}  # username -> (text, ts), chống gửi trùng do reconnect/double-submit
 
 
 @socketio.on("chat_message")
@@ -456,6 +512,15 @@ def on_chat_message(data):
     if not text:
         return
     text = text[:MAX_MESSAGE_LENGTH]
+
+    # Chống trùng: bỏ qua nếu cùng user gửi đúng nội dung này trong vòng 2 giây
+    # (thường do client gửi lặp khi socket reconnect, hoặc double-tap trên mobile).
+    prev = _last_msg_by_user.get(username)
+    now = now_ts()
+    if prev and prev[0] == text and now - prev[1] < 2.0:
+        return
+    _last_msg_by_user[username] = (text, now)
+
     msg = add_message(username, text, "chat", avatar=avatar)
     emit("new_message", msg, room=ROOM)
 
@@ -627,5 +692,12 @@ if __name__ == "__main__":
 
     try:
         socketio.run(app, host=HOST, port=PORT, debug=False, allow_unsafe_werkzeug=True)
+    except KeyboardInterrupt:
+        print("\n[*] Nhận Ctrl+C - đang thoát chương trình...")
     finally:
         stop_tunnel()
+        # Một số async mode (eventlet/gevent) có thể giữ lại greenlet/thread nền
+        # sau khi socketio.run() trả về, khiến tiến trình không thoát hẳn dù đã
+        # bắt được KeyboardInterrupt. os._exit() buộc thoát ngay lập tức, bỏ qua
+        # mọi cleanup Python bình thường (đã chạy xong ở finally phía trên rồi).
+        os._exit(0)
