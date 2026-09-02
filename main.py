@@ -308,13 +308,16 @@ def call_gemma(history_context):
     now_utc_str = format_utc(now_ts())
     default_note = (
         "Bạn là một người tham gia trò chuyện tên là '%s' trong một phòng chat "
-        "công cộng nhiều người. Thời điểm hiện tại là %s. Mỗi tin nhắn trong "
-        "lịch sử dưới đây được đánh dấu mốc thời gian ở đầu dòng theo định dạng "
-        "[unix_ts | ngày giờ UTC] - dùng nó để biết tin nào cũ/mới hoặc khoảng "
-        "cách thời gian giữa các tin nếu cần, KHÔNG phải là nội dung người dùng "
-        "gõ. Trả lời ngắn gọn, tự nhiên, thân thiện bằng tiếng Việt (trừ khi "
-        "được hỏi bằng ngôn ngữ khác). Không cần lặp lại câu hỏi, và chỉ nhắc "
-        "tới thời gian khi được hỏi trực tiếp."
+        "công cộng nhiều người. Thời điểm hiện tại là %s. Một số tin nhắn của "
+        "người dùng trong lịch sử được đánh dấu mốc thời gian ở đầu dòng theo "
+        "định dạng [unix_ts | ngày giờ UTC] - đây CHỈ LÀ METADATA nội bộ để bạn "
+        "tham khảo tin nào cũ/mới, KHÔNG phải nội dung người dùng gõ và KHÔNG "
+        "phải định dạng bạn cần dùng. TUYỆT ĐỐI KHÔNG chèn mốc thời gian, dấu "
+        "ngoặc vuông, hay bất kỳ tiền tố nào kiểu vậy vào câu trả lời của bạn - "
+        "chỉ trả lời như một người bình thường đang nhắn tin. Trả lời ngắn gọn, "
+        "tự nhiên, thân thiện bằng tiếng Việt (trừ khi được hỏi bằng ngôn ngữ "
+        "khác). Không cần lặp lại câu hỏi, và chỉ nhắc tới thời gian bằng lời "
+        "văn bình thường khi được hỏi trực tiếp."
         % (BOT_NAME, now_utc_str)
     )
     if BOT_CUSTOM_INSTRUCTION:
@@ -326,8 +329,16 @@ def call_gemma(history_context):
     contents = []
     for h in history_context[-10:]:
         role = "model" if h["type"] == "bot" else "user"
-        ts_prefix = f"[{int(h['ts'])} | {format_utc(h['ts'])}] "
-        text = f"{ts_prefix}{h['user']}: {h['text']}" if role == "user" else f"{ts_prefix}{h['text']}"
+        if role == "user":
+            # Chỉ gắn mốc thời gian cho tin nhắn CỦA NGƯỜI DÙNG - đây là dữ liệu
+            # ngữ cảnh để bot tham khảo, không phải mẫu để bắt chước.
+            ts_prefix = f"[{int(h['ts'])} | {format_utc(h['ts'])}] "
+            text = f"{ts_prefix}{h['user']}: {h['text']}"
+        else:
+            # Tin nhắn cũ CỦA CHÍNH BOT giữ nguyên văn, KHÔNG gắn timestamp -
+            # nếu gắn, model sẽ học theo pattern này và tự chèn mốc thời gian
+            # vào mọi câu trả lời sau đó (đã xảy ra trên thực tế).
+            text = h["text"]
         contents.append(types.Content(role=role, parts=[types.Part.from_text(text=text)]))
     # LƯU Ý: KHÔNG append thêm tin nhắn hiện tại riêng nữa ở đây - nó đã nằm
     # sẵn trong history_context (được lưu DB trước khi tác vụ bot bắt đầu chạy).
