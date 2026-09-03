@@ -6,10 +6,13 @@
 <title>Phòng Chat Chung</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
 <style>
+  html {
+    height: 100%;
+  }
   * { box-sizing: border-box; }
   body {
     margin: 0; font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    background: #0f1115; color: #e6e6e6; height: 100vh; display: flex; flex-direction: column;
+    background: #0f1115; color: #e6e6e6; height: 100dvh; display: flex; flex-direction: column;
   }
   #login-screen {
     flex: 1; display: flex; align-items: center; justify-content: center; flex-direction: column;
@@ -40,7 +43,7 @@
   #google-profile .g-logout { font-size: 0.78rem; color: #7d8592; text-decoration: underline; cursor: pointer; }
   .avatar-sm { width: 22px; height: 22px; border-radius: 50%; vertical-align: middle; margin-right: 4px; object-fit: cover; }
 
-  #chat-screen { display: none; flex: 1; flex-direction: column; height: 100vh; }
+  #chat-screen { display: none; flex: 1; flex-direction: column; height: 100dvh; }
   #topbar {
     display: flex; justify-content: space-between; align-items: center;
     padding: 10px 16px; background: #161920; border-bottom: 1px solid #262a33;
