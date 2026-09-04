@@ -5,3 +5,4 @@ eventlet
 google-genai
 Authlib
 Pillow
+beautifulsoup4
