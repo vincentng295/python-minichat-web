@@ -15,6 +15,8 @@ from authlib.integrations.flask_client import OAuth
 from google import genai
 from google.genai import types
 from werkzeug.middleware.proxy_fix import ProxyFix
+import random
+from bing_image import Bing
 
 try:
     from PIL import Image
@@ -80,6 +82,18 @@ TUNNEL_TOKEN = os.getenv("TUNNEL_TOKEN", "").strip()
 _cloudflared_proc = None
 _cloudflared_url = None
 
+def get_random_image_link_tool(keyword, get=20, adult="on"):
+    try:
+        img_links = Bing(keyword, get, adult, timeout=10, filter="", excludeSites=[
+            "*.vectorstock.com", "*.shutterstock.com", "*.gettyimages.com",
+            "*.istockphoto.com", "*.dreamstime.com", "*.123rf.com",
+            "*.depositphotos.com", "*.alamy.com", "*.bigstockphoto.com",
+            "*.adobestock.com", "*.lpsg.com"
+        ], verbose=False).get_image_links()
+        return random.choice(img_links) if img_links else None
+    except Exception as e:
+        print(f"Error fetching images: {e}")
+        return None
 
 def load_bot_instruction():
     try:
@@ -158,11 +172,15 @@ def init_db():
         existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(messages)")}
         if "avatar" not in existing_cols:
             conn.execute("ALTER TABLE messages ADD COLUMN avatar TEXT")
+        # Thêm cột image_url để lưu ảnh đính kèm
+        if "image_url" not in existing_cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN image_url TEXT")
+            
         conn.commit()
         conn.close()
 
 
-def add_message(user, text, mtype="chat", avatar=None):
+def add_message(user, text, mtype="chat", avatar=None, image_url=None):
     text = text[:MAX_MESSAGE_LENGTH]
     msg = {
         "id": uuid.uuid4().hex,
@@ -171,12 +189,13 @@ def add_message(user, text, mtype="chat", avatar=None):
         "ts": now_ts(),
         "type": mtype,  # chat | system | bot
         "avatar": avatar,
+        "image_url": image_url, # Lưu link ảnh
     }
     with db_lock:
         conn = get_db()
         conn.execute(
-            "INSERT INTO messages (id, user, text, ts, type, avatar) VALUES (?, ?, ?, ?, ?, ?)",
-            (msg["id"], msg["user"], msg["text"], msg["ts"], msg["type"], msg["avatar"]),
+            "INSERT INTO messages (id, user, text, ts, type, avatar, image_url) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (msg["id"], msg["user"], msg["text"], msg["ts"], msg["type"], msg["avatar"], msg["image_url"]),
         )
         # Giữ tối đa MAX_HISTORY tin nhắn - xoá bớt tin cũ nhất khi vượt ngưỡng
         conn.execute("""
@@ -194,8 +213,9 @@ def load_recent_messages(limit=None, for_display=False):
     limit = limit or HISTORY_LOAD_LIMIT
     with db_lock:
         conn = get_db()
+        # Query thêm cột image_url
         rows = conn.execute(
-            "SELECT id, user, text, ts, type, avatar FROM messages ORDER BY ts DESC LIMIT ?",
+            "SELECT id, user, text, ts, type, avatar, image_url FROM messages ORDER BY ts DESC LIMIT ?",
             (limit,),
         ).fetchall()
         conn.close()
@@ -305,7 +325,7 @@ def call_gemma(history_context):
     history_context: danh sách tin nhắn gần nhất (đã bao gồm tin nhắn mới nhất
     kích hoạt bot trả lời, vì nó được lưu vào DB trước khi tác vụ nền này chạy)."""
     if not BOT_ENABLED or genai_client is None:
-        return None
+        return None, None # Trả về tuple (text, image_url)
 
     now_utc_str = format_utc(now_ts())
     default_note = (
@@ -320,13 +340,10 @@ def call_gemma(history_context):
         "tự nhiên, thân thiện bằng tiếng Việt (trừ khi được hỏi bằng ngôn ngữ "
         "khác). Không cần lặp lại câu hỏi, và chỉ nhắc tới thời gian bằng lời "
         "văn bình thường khi được hỏi trực tiếp."
+        "Nếu người dùng yêu cầu tìm ảnh, xem ảnh hoặc gửi ảnh, hãy sử dụng công cụ get_random_image."
         % (BOT_NAME, now_utc_str)
     )
-    if BOT_CUSTOM_INSTRUCTION:
-        # Nội dung instruction.txt được inject vào đầu system instruction
-        system_note = BOT_CUSTOM_INSTRUCTION + "\n\n" + default_note
-    else:
-        system_note = default_note
+    system_note = (BOT_CUSTOM_INSTRUCTION + "\n\n" + default_note) if BOT_CUSTOM_INSTRUCTION else default_note
 
     contents = []
     for h in history_context[-10:]:
@@ -346,35 +363,95 @@ def call_gemma(history_context):
     # sẵn trong history_context (được lưu DB trước khi tác vụ bot bắt đầu chạy).
     # Trước đây có bug append trùng khiến model nhận được cùng 1 câu 2 lần.
     if not contents:
-        return None
+        return None, None
+
+    # Khai báo Tool tìm kiếm ảnh cho Gemini
+    search_image_func = types.FunctionDeclaration(
+        name="get_random_image",
+        description="Tìm kiếm ảnh trên internet. Sử dụng hàm này khi người dùng yêu cầu gửi, tìm hoặc xem một bức ảnh nào đó.",
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "keyword": types.Schema(
+                    type=types.Type.STRING, 
+                    description="Từ khóa để tìm kiếm ảnh (ví dụ: 'mèo cute', 'phong cảnh đẹp'). Ưu tiên dịch từ khóa sang tiếng Anh để kết quả tốt hơn."
+                )
+            },
+            required=["keyword"]
+        )
+    )
+
+    tools = [types.Tool(function_declarations=[search_image_func])]
+    if BOT_ENABLE_GOOGLE_SEARCH:
+        tools.append(types.Tool(google_search=types.GoogleSearch()))
 
     config_kwargs = {
         "temperature": BOT_TEMPERATURE,
         "max_output_tokens": BOT_MAX_OUTPUT_TOKENS,
         "system_instruction": [types.Part.from_text(text=system_note)],
+        "tools": tools # Đính kèm tool vào API
     }
     if BOT_THINKING_LEVEL:
         config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=BOT_THINKING_LEVEL)
-    if BOT_ENABLE_GOOGLE_SEARCH:
-        config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
 
     generate_content_config = types.GenerateContentConfig(**config_kwargs)
 
     try:
-        response_text = ""
-        for chunk in genai_client.models.generate_content_stream(
+        # Lần gọi 1: Cho phép bot đánh giá xem có cần dùng Tool hay không
+        response = genai_client.models.generate_content(
             model=GEMMA_MODEL,
             contents=contents,
             config=generate_content_config,
-        ):
-            if chunk.text:
-                response_text += chunk.text
-        print("Calling Gemini, return:", response_text)
-        return response_text.strip() or None
+        )
+
+        image_url = None
+
+        # Nếu model quyết định gọi function
+        if response.function_calls:
+            for fc in response.function_calls:
+                if fc.name == "get_random_image":
+                    keyword = fc.args.get("keyword")
+                    print(f"[*] Bot đang tìm ảnh cho từ khóa: {keyword}")
+                    img_link = get_random_image_link_tool(keyword)
+
+                    if img_link:
+                        image_url = img_link
+                        tool_result = {"url": img_link}
+                    else:
+                        tool_result = {"error": "Không tìm thấy ảnh"}
+
+                    # Gắn phản hồi của Function vào context để trả lại cho Bot
+                    contents.append(response.candidates[0].content)
+                    contents.append(
+                        types.Content(
+                            role="user",
+                            parts=[
+                                types.Part.from_function_response(
+                                    name="get_random_image",
+                                    response=tool_result
+                                )
+                            ]
+                        )
+                    )
+
+            # Lần gọi 2: Sinh câu trả lời cuối cùng kèm text sau khi đã có link ảnh
+            final_response = genai_client.models.generate_content(
+                model=GEMMA_MODEL,
+                contents=contents,
+                config=generate_content_config,
+            )
+            final_text = final_response.text.strip() if final_response.text else ""
+            print("Calling Gemini, return:", "<Nothing>" if not final_text else final_text)
+            return final_text, image_url
+            
+        else:
+            text_result = response.text.strip() if response.text else ""
+            print("Calling Gemini, return:", "<Nothing>" if not text_result else text_result)
+            return text_result, None
+
     except Exception as e:
         print("Gemma call failed:", e)
-        return None
-
+        return None, None
 
 @app.route("/")
 def index():
@@ -649,11 +726,15 @@ def _bot_retry_task():
 def handle_bot_reply(username, text):
     socketio.sleep(0.3)
     recent_context = load_recent_messages(limit=10)
-    reply = call_gemma(recent_context)
-    if reply:
-        bot_msg = add_message(BOT_NAME, reply, "bot", avatar=BOT_AVATAR_URL)
-        # DB vẫn lưu type="bot" để phân biệt role khi xây ngữ cảnh cho model;
-        # chỉ mask type khi phát cho client hiển thị (chế độ giống người thật).
+    
+    # Nhận cả chuỗi văn bản và link ảnh
+    reply, image_url = call_gemma(recent_context)
+    
+    if reply or image_url:
+        if not reply: 
+            reply = ""
+        
+        bot_msg = add_message(BOT_NAME, reply, "bot", avatar=BOT_AVATAR_URL, image_url=image_url)
         socketio.emit("new_message", mask_bot_type(bot_msg), room=ROOM)
 
 

@@ -359,15 +359,38 @@ function renderMessage(msg) {
     const isBot = msg.type === 'bot';
     const isMine = msg.user === myUsername;
     div.className = 'msg ' + (isBot ? 'bot' : (isMine ? 'mine' : 'other'));
+    
     const meta = document.createElement('div');
     meta.className = 'meta';
     meta.innerHTML = (msg.avatar ? `<img class="avatar-sm" src="${msg.avatar}" alt="">` : '') +
       (isBot ? '🤖 ' : '') + escapeHtml(msg.user) +
       ` <span class="msg-time" title="${new Date((msg.ts || 0) * 1000).toISOString()}">${formatLocalTime(msg.ts)}</span>`;
+      
     const body = document.createElement('div');
     body.textContent = msg.text;
+    
     div.appendChild(meta);
     div.appendChild(body);
+
+    // KIỂM TRA VÀ HIỂN THỊ ẢNH NẾU CÓ
+    if (msg.image_url) {
+      const imgContainer = document.createElement('div');
+      imgContainer.style.marginTop = '10px';
+      
+      const img = document.createElement('img');
+      img.src = msg.image_url;
+      img.style.maxWidth = '100%';
+      img.style.borderRadius = '8px';
+      img.style.cursor = 'zoom-in';
+      img.style.display = 'block';
+      img.onclick = () => window.open(msg.image_url, '_blank');
+      
+      // Ẩn khối ảnh nếu bị lỗi load url
+      img.onerror = () => { imgContainer.style.display = 'none'; }; 
+      
+      imgContainer.appendChild(img);
+      div.appendChild(imgContainer);
+    }
   }
   messagesEl.appendChild(div);
 }
