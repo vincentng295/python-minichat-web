@@ -389,7 +389,10 @@ def call_gemma(history_context):
         "temperature": BOT_TEMPERATURE,
         "max_output_tokens": BOT_MAX_OUTPUT_TOKENS,
         "system_instruction": [types.Part.from_text(text=system_note)],
-        "tools": tools # Đính kèm tool vào API
+        "tools": tools,
+        "tool_config": types.ToolConfig(
+            include_server_side_tool_invocations=True
+        )
     }
     if BOT_THINKING_LEVEL:
         config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_level=BOT_THINKING_LEVEL)
